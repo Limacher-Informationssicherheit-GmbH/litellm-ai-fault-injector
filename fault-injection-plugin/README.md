@@ -1,6 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Fault-Injection Plugin for LiteLLM
 
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Writeup](https://img.shields.io/badge/Writeup-limacher--itsec.ch-0a7ea4.svg)](https://limacher-itsec.ch/blog/ai-fault-projection.html)
+
 A LiteLLM proxy callback that **deliberately injects subtle faults** into LLM
 responses to measure whether users notice — an *awareness* tool, analogous to
 phishing simulations. It is **transparent by design**: every manipulation is
@@ -11,6 +14,9 @@ marked and audited so it can be reconstructed and debriefed.
 > established up front at the organization/training level and resolved by a
 > debrief. Never point this at users making real high-stakes decisions — the
 > `targets` allowlist/denylist exists to enforce that.
+
+**Background:** [The AI fault-injection writeup](https://limacher-itsec.ch/blog/ai-fault-projection.html)
+explains the threat model and why measuring the *noticed rate* matters.
 
 ## How it works
 
