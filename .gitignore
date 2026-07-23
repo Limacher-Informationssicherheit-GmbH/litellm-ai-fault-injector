@@ -1,0 +1,10 @@
+# Audit + feedback logs hold full prompts/responses (sensitive). Never commit.
+*.jsonl
+*.jsonl.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

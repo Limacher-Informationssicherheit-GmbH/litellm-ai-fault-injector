@@ -1,0 +1,13 @@
+# Pin LiteLLM exactly: the proxy hook surface moves weekly and internal shapes
+# (streaming iterator hook signature, response types) change across releases.
+# Verified against this line during development (2026-07).
+litellm[proxy]==1.93.0
+
+PyYAML>=6.0
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
+
+# test-only
+pytest>=8.0
+pytest-asyncio>=0.23

@@ -1,0 +1,46 @@
+# Example LiteLLM proxy config wiring in the fault-injection callback.
+# Start the proxy with:  litellm --config config/proxy_config.yaml
+#
+# NOTE: fault injection is a controlled awareness tool. Only enable it in
+# environments where operators/trainees are briefed and a debrief will follow.
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      # api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  # register the callback (module.ClassName; module must be importable)
+  callbacks: ["fault_injector.FaultInjector"]
+
+# ---------------------------------------------------------------------------
+# Fault-injection plugin settings (read by config.FaultInjectionConfig)
+# ---------------------------------------------------------------------------
+fault_injection:
+  enabled: true                 # kill-switch; env FAULT_INJECTION_ENABLED overrides
+  inject_rate: 0.1              # fraction of eligible responses to manipulate
+  deterministic: false          # true -> mechanical injectors only + seeded (repro)
+  seed: 1337
+
+  # relative weights; renormalized over whichever injectors apply to a response
+  error_types:
+    factual: 0.4
+    fake_source: 0.3
+    logic_break: 0.2
+    bad_code: 0.1
+
+  # model used by the LLM-in-the-loop injectors (factual, logic_break).
+  # Its own call bypasses injection (no recursion).
+  llm_injector:
+    model: "gpt-4o-mini"
+    max_len_delta: 0.25         # discard rewrite if length drifts beyond this
+
+  # blast-radius guard, enforced BEFORE sampling. Fail-closed: with an empty
+  # allowlist nothing is targetable.
+  targets:
+    allow_key_aliases: ["redteam-*"]   # only these virtual-key aliases are eligible
+    deny_topics: ["medical", "legal", "financial"]
+
+  audit_log_path: "./audit/injections.jsonl"
+  feedback_log_path: "./audit/feedback.jsonl"

@@ -1,0 +1,123 @@
+# Fault-Injection-Plugin für LiteLLM – Implementierungs-Brief
+
+**Zweck dieses Dokuments:** Grober Abriss für Claude Code zur Umsetzung eines
+LiteLLM-Plugins, das kontrolliert Fehler in LLM-Antworten einspielt, um die
+Nutzerreaktion zu testen (Awareness-Tool, analog zu Phishing-Simulationen).
+
+---
+
+## 1. Kontext & Ziel
+
+- **Idee:** Der Proxy manipuliert einen Teil der Antworten absichtlich, damit
+  gemessen werden kann, ob Nutzer Fehler bemerken oder LLM-Ausgaben blind
+  vertrauen.
+- **Nicht das Ziel:** heimliche Täuschung. Injizierte Antworten müssen
+  markierbar und im Nachhinein auflösbar sein (Debrief).
+- **Scope-Entscheidung:** *provider-übergreifend, alles gleich behandeln.* Ein
+  einziger globaler Handler, keine provider-spezifische Sonderlogik.
+
+## 2. Stack
+
+- **Proxy:** LiteLLM (Proxy-/Gateway-Modus, self-hosted).
+- **Sprache:** Python (LiteLLM Custom-Callback-Klasse).
+- **Kern-Hook:** `async_post_call_success_hook(data, user_api_key_dict, response)`
+  – greift auf das bereits normalisierte, einheitliche Response-Objekt zu, also
+  provider-unabhängig. Ideal für „alles gleich".
+- **Registrierung:** über `proxy_config.yaml` als Callback laden.
+
+## 3. Architektur (grob)
+
+```
+Client → LiteLLM Proxy → LLM-Provider
+                     ↑
+          FaultInjector (post_call_success_hook)
+          - Sampling-Entscheidung
+          - Fehler in content injizieren
+          - Transparenz-Header/Marker setzen
+          - Audit-Log schreiben
+```
+
+Handler subklassifiziert `litellm.integrations.custom_logger.CustomLogger` und
+implementiert `async_post_call_success_hook`. Manipuliert wird
+`response.choices[0].message.content`.
+
+## 4. Funktionale Anforderungen
+
+1. **Sampling:** Konfigurierbare Rate (z. B. `inject_rate: 0.1`), welcher Anteil
+   der Antworten manipuliert wird.
+2. **Fehlertypen** (mind. je ein Injektor, per Config aktivierbar/gewichtbar):
+   - faktische Fehler (Zahl/Datum/Name subtil verändern)
+   - erfundene Quelle/Zitat
+   - logischer Bruch / Widerspruch im Text
+   - fehlerhafter Code-Snippet (falls Antwort Code enthält)
+3. **Transparenz-Marker:** bei jeder manipulierten Antwort einen Header setzen,
+   z. B. `x-fault-injected: true` (über `response._hidden_params`
+   → `additional_headers`). Dient Audit und Debrief.
+4. **Audit-Log:** Zeitpunkt, Request-ID, injizierter Fehlertyp, Original- vs.
+   manipulierter Inhalt – separat und persistent ablegen (für die spätere
+   Reaktionsauswertung).
+5. **Kill-Switch:** globales Enable/Disable per Config-Flag oder Env-Variable.
+
+## 5. Konfiguration (Beispielstruktur)
+
+```yaml
+# proxy_config.yaml (Ausschnitt)
+litellm_settings:
+  callbacks: ["fault_injector.FaultInjector"]
+
+fault_injection:
+  enabled: true
+  inject_rate: 0.1
+  error_types:
+    factual: 0.4
+    fake_source: 0.3
+    logic_break: 0.2
+    bad_code: 0.1
+  audit_log_path: "./audit/injections.jsonl"
+```
+
+## 6. Bekannte Stolpersteine
+
+- **Streaming:** Für gestreamte Antworten ist
+  `async_post_call_streaming_iterator_hook` zuständig. Hier gab es historisch
+  einen Bug, bei dem der Hook im Proxy-Streaming-Pfad nicht ausgeführt wurde und
+  Änderungen nicht durchkamen (beobachtet in v1.59.9). **To do für Claude Code:**
+  an aktueller LiteLLM-Version prüfen, ob behoben. Bis dahin zunächst nur
+  `stream=false` unterstützen und Streaming klar als „nicht unterstützt"
+  kennzeichnen.
+- **Zustand zwischen Hooks:** Das Durchreichen von Daten aus `pre_call` in den
+  Post-Hook ist in LiteLLM ein bekannter Reibungspunkt. Für „alles gleich" nicht
+  nötig – die Injektionsentscheidung komplett im Post-Hook treffen.
+
+## 7. Lizenz
+
+- LiteLLM steht unter MIT (permissiv, Copyleft-kompatibel).
+- **Plugin-Lizenz: AGPLv3.** Da der Proxy Netzwerksoftware ist, greift die
+  Copyleft-Pflicht bei AGPL auch bei reiner Netznutzung (On-Prem/SaaS-Zugriff).
+- `LICENSE`-Datei und SPDX-Header in jeder Quelldatei ergänzen.
+
+## 8. Ethik / Betriebsrahmen
+
+- Nur in Umgebungen einsetzen, in denen die Betreiber-/Trainingsseite eingeweiht
+  ist.
+- Debrief-Pfad vorsehen: manipulierte Antworten müssen über Marker + Audit-Log
+  eindeutig rekonstruier- und auflösbar sein.
+
+## 9. Vorgeschlagene Dateistruktur
+
+```
+fault-injection-plugin/
+├── fault_injector.py        # CustomLogger-Handler + Injektoren
+├── injectors/               # einzelne Fehlertyp-Strategien
+├── config/proxy_config.yaml # Beispielkonfig
+├── audit/                   # Audit-Logs (gitignored)
+├── tests/                   # Unit-Tests je Injektor + Sampling
+├── LICENSE                  # AGPLv3
+└── README.md
+```
+
+## 10. Offene Punkte für Claude Code
+
+- Aktuelle LiteLLM-Version festnageln und Streaming-Hook-Status prüfen.
+- Datenformat des Audit-Logs finalisieren (JSONL vorgeschlagen).
+- Tests: deterministischer Modus (fester Seed) für reproduzierbare Injektion.
