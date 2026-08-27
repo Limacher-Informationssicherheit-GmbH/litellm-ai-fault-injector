@@ -1,0 +1,72 @@
+# Example LiteLLM proxy config wiring in the fault-injection callback.
+#
+# This file MUST live in the same directory as fault_injector.py: LiteLLM's
+# get_instance_fn resolves a dotted callback path against *this file's*
+# directory (dirname(config) + "/fault_injector.py"), not against sys.path.
+#
+# Start the proxy from the plugin root:  litellm --config proxy_config.yaml
+#
+# NOTE: fault injection is a controlled awareness tool. Only enable it in
+# environments where operators/trainees are briefed and a debrief will follow.
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      # api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  # Register the module-level INSTANCE, not the class. get_instance_fn only
+  # does getattr(module, "proxy_handler_instance") — it never instantiates, so
+  # a class path leaves LiteLLM holding a class: the streaming and header hooks
+  # are filtered out by their isinstance(CustomLogger) check and the success
+  # hook is dispatched unbound (TypeError -> 500 on every completion).
+  # LiteLLM >= 1.98.0 rejects a class-valued callback at config load outright.
+  callbacks: ["fault_injector.proxy_handler_instance"]
+
+# ---------------------------------------------------------------------------
+# Fault-injection plugin settings (read by config.FaultInjectionConfig)
+# ---------------------------------------------------------------------------
+fault_injection:
+  # Kill-switch, shipped OFF. This is an example file meant to be copied, and a
+  # copy that arrives armed only needs a matching key alias to start deceiving
+  # real users; FAULT_INJECTION_ENABLED can force injection off but never on,
+  # so nothing downstream would catch it. Turn this on deliberately, per
+  # deployment, once the briefing and debrief are in place.
+  enabled: false
+  inject_rate: 0.1              # fraction in [0,1]; out-of-range fails closed to 0
+  deterministic: false          # true -> mechanical injectors only + seeded (repro)
+  seed: 1337
+
+  # relative weights; renormalized over whichever injectors apply to a response
+  error_types:
+    factual: 0.4
+    fake_source: 0.3
+    logic_break: 0.2
+    bad_code: 0.1
+
+  # Model used by the LLM-in-the-loop injectors (factual, logic_break).
+  # Its own call bypasses injection (no recursion).
+  #
+  # PRIVACY: these injectors send the FULL original answer to this model over a
+  # direct SDK call, so it leaves by whatever path `model` resolves to and skips
+  # any DLP the proxy applies. Use a cleared deployment, or set
+  # `deterministic: true` above to keep every answer inside the proxy.
+  llm_injector:
+    model: "gpt-4o-mini"
+    max_len_delta: 0.25         # discard rewrite if length drifts beyond this
+    timeout_s: 20               # bound the inline rewrite call
+
+  # blast-radius guard, enforced BEFORE sampling. Fail-closed: with an empty
+  # allowlist nothing is targetable.
+  # A request with no key alias is never targetable, so ["*"] does NOT mean
+  # "unkeyed traffic too" — but it does mean every keyed caller. Use dedicated
+  # red-team aliases; never ship ["*"].
+  targets:
+    allow_key_aliases: ["redteam-*"]   # only these virtual-key aliases are eligible
+    # Best-effort prompt filter, NOT a safety boundary: substring-only, scans
+    # the request (messages + Anthropic-style `system`) and never the answer.
+    deny_topics: ["medical", "legal", "financial"]
+
+  audit_log_path: "./audit/injections.jsonl"
+  feedback_log_path: "./audit/feedback.jsonl"

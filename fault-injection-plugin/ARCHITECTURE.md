@@ -37,13 +37,47 @@ post-hoc analysis, not something the hot path needs.
 
 | module | responsibility |
 |--------|----------------|
-| `fault_injector.py` | `FaultInjector(CustomLogger)` — the three hooks, sampling, target-guard, orchestration, audit writes. The only module LiteLLM loads. |
+| `fault_injector.py` | `FaultInjector(CustomLogger)` — the three hooks, sampling, target-guard, orchestration, audit writes. The only module LiteLLM loads; it exposes the `proxy_handler_instance` LiteLLM registers (§2.1). |
 | `config.py` | `FaultInjectionConfig` dataclasses; YAML + env loading; `active_error_types()` gates LLM injectors out of deterministic mode. |
 | `injectors/` | Strategy pattern. `base.py` defines the `Injector` protocol; `mechanical.py` and `llm.py` implement it; `__init__.build_injectors()` is the registry/factory. |
 | `state.py` | `DecisionStore` (per-request injection decision, shared across hooks) + bypass-flag helpers. |
 | `audit_log.py` | Atomic JSONL append: `write_entry` (used by the injector) wraps `append_json` (used directly by the feedback service). |
 | `feedback_api.py` | FastAPI service capturing user reactions to `feedback.jsonl`. |
 | `report.py` | Joins injections ⋈ feedback → noticed-rate metric. |
+
+### 2.1 Registration contract
+
+`proxy_config.yaml` registers **an instance**:
+
+```yaml
+litellm_settings:
+  callbacks: ["fault_injector.proxy_handler_instance"]
+```
+
+`litellm.proxy.types_utils.utils.get_instance_fn` resolves that string by
+`getattr(module, attr)` — **it never instantiates**. Two consequences shape the
+layout of this plugin:
+
+1. **The attribute must already be an instance.** With a class-valued callback,
+   `ProxyLogging._callback_capabilities()` and
+   `post_call_response_headers_hook` both apply
+   `isinstance(cb, CustomLogger)` — False for a class — so the
+   streaming-iterator and header hooks are dropped with no error, while
+   `post_call_success_hook` has *no* such guard and dispatches the unbound
+   function, raising `TypeError: missing 1 required positional argument:
+   'self'`, which it re-raises into a 500 on every completion. The result is a
+   plugin whose hooks are individually correct and collectively never run.
+   LiteLLM ≥ 1.98.0 refuses a class-valued callback at config load instead.
+2. **The module is located relative to the YAML**, as
+   `dirname(config_file_path) + "/fault_injector.py"`, and loaded by
+   `spec_from_file_location`. So the YAML lives beside the module — and because
+   by-path loading does not put the module's directory on `sys.path`,
+   `fault_injector.py` inserts its own directory there before importing its
+   siblings.
+
+`tests/test_registration.py` re-implements that resolution against the shipped
+YAML, so both invariants fail in CI rather than at proxy boot. The hook-body
+tests construct a `FaultInjector` directly and structurally cannot catch either.
 
 ## 3. Request lifecycle
 
@@ -81,9 +115,9 @@ designed away; the audit log is the answer to it.
 ```
 enabled? ──no──► pass through
    │yes
-bypass call? ──yes──► pass through          (the injector's own nested LLM call)
-   │no
-target-guard: key alias ∈ allowlist AND no denied topic? ──no──► pass through
+bypass call? ──yes──► pass through          (the injector's own nested LLM call,
+   │no                                       proven by a per-process secret token)
+target-guard: key alias non-empty ∈ allowlist AND no denied topic? ──no──► pass through
    │yes
 sample: rng.random() < inject_rate? ──no──► pass through
    │yes
@@ -122,6 +156,15 @@ Two families:
      Without this, an injected answer could trigger another injection.
   2. **Fail safe.** An unchanged, empty, or length-divergent rewrite (>
      `max_len_delta`) is rejected → decline, never emit a corrupted response.
+  3. **Bounded.** The rewrite sits inline on a response the user is already
+     waiting for, so it carries both a provider timeout and an
+     `asyncio.wait_for` ceiling (`llm_injector.timeout_s`).
+
+  These two are also the plugin's only **data-egress path**: the full original
+  answer is sent to `llm_injector.model` over a direct SDK call, so it skips
+  whatever DLP or redaction the *proxy* applies to normal traffic. That is a
+  deployment decision, not a bug — but it must be a deliberate one, so it is
+  called out at the config site and `deterministic: true` removes the path.
 
 `deterministic: true` removes the LLM family entirely (both from the weights via
 `active_error_types()` and from construction in `build_injectors()`), leaving a
@@ -139,7 +182,12 @@ fully reproducible, seed-driven system — the mode the test suite runs in.
 - **RNG**: in deterministic mode the per-request RNG is seeded from
   `f"{seed}:{call_id}"`, making injection reproducible **and order-independent
   under concurrency** (no shared mutable RNG). In normal mode it uses system
-  entropy.
+  entropy. Both halves of one decision — the sampling draw and the injector
+  choice — must be seeded from the **same** id. The streaming path therefore
+  seeds both from the request-derived `litellm_call_id`, even though it *audits*
+  under the client-visible completion id: that completion id is
+  provider-assigned and differs on every run, so seeding the injector choice
+  from it would leave `deterministic` mode reproducible in name only.
 
 ## 7. Shape-guard (provider uniformity)
 
@@ -159,10 +207,26 @@ content field and risks corrupting an unrelated response.
   breaks the response).
 - Every injector can decline; the orchestrator always has a defined
   pass-through path.
-- The plugin fails **closed**: missing/unparseable config, empty allowlist, a
-  non-numeric/out-of-range rate, or an unrecognized response shape all result in
-  *no injection*, never an accidental one. The `FAULT_INJECTION_ENABLED` env var
-  is one-directional — it can force injection off but never on.
+- The plugin fails **closed**: missing/unparseable config, empty allowlist, an
+  absent key alias, a non-numeric/out-of-range rate, or an unrecognized response
+  shape all result in *no injection*, never an accidental one. An out-of-range
+  `inject_rate` resolves to `0.0` and is deliberately **not** clamped up to
+  `1.0`: clamping up would convert a `10` -typed-for-`0.1` typo into 100%
+  injection — the worst outcome, produced by the guard meant to prevent it. The
+  `FAULT_INJECTION_ENABLED` env var is one-directional — it can force injection
+  off but never on, and the shipped example config is `enabled: false`.
+- **No hook can break a response.** LiteLLM re-raises whatever a post-call hook
+  throws, so an uncontained error here would 500 an already-successful
+  completion. All three hooks catch their own exceptions and degrade to
+  pass-through; the streaming hook ships its buffered chunks unmodified.
+- **The bypass tag is unforgeable.** `data["metadata"]` is caller-controlled, so
+  a truthy-flag check would let any client opt out of the awareness test and
+  skew the noticed-rate. The tag must carry `state.BYPASS_TOKEN`, a per-process
+  secret regenerated at boot.
+- **The LLM injectors are a data-egress path** (§5): they send the full original
+  answer to `llm_injector.model` over a direct SDK call, bypassing proxy-level
+  DLP, under an `llm_injector.timeout_s` bound so a hung rewrite cannot pin the
+  worker. `deterministic: true` removes that path entirely.
 
 ## 9. Extending it
 

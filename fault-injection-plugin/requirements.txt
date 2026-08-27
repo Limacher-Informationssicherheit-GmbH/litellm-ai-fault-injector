@@ -1,6 +1,13 @@
 # Pin LiteLLM exactly: the proxy hook surface moves weekly and internal shapes
-# (streaming iterator hook signature, response types) change across releases.
-# Verified against this line during development (2026-07).
+# (streaming iterator hook signature, response types) change across releases —
+# as do the CALLBACK-LOADING rules (>=1.98.0 rejects a class-valued callback at
+# config load, where 1.93.0 accepts it and then 500s at dispatch; see
+# tests/test_registration.py). Verified against this line during development
+# (2026-07). Re-run the full suite on any bump.
+#
+# These are version pins, not integrity pins. For a deployment, generate hashes
+# yourself (`pip-compile --generate-hashes`) and install with
+# `pip install --require-hashes`.
 litellm[proxy]==1.93.0
 
 PyYAML>=6.0

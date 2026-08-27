@@ -9,10 +9,15 @@ Run it on its own so conftest does NOT install the litellm stub:
 
     RUN_INTEGRATION=1 python -m pytest tests/test_integration_smoke.py
 
-Full end-to-end (manual): boot ``litellm --config config/proxy_config.yaml``,
-issue a stream=false completion, and assert the body was mutated, the
-``x-fault-injected`` header is present, and one audit line was written; repeat
-with stream=true and with a denied-topic request (must be untouched).
+Full end-to-end (manual): from the plugin root boot
+``litellm --config proxy_config.yaml`` (with ``enabled: true`` and a matching
+key alias), issue a stream=false completion, and assert the body was mutated,
+the ``x-fault-injected`` header is present, and one audit line was written;
+repeat with stream=true and with a denied-topic request (must be untouched).
+
+``tests/test_registration.py`` covers, hermetically, whether LiteLLM will
+*reach* these hooks at all — this file only proves they behave correctly on
+real LiteLLM types once called.
 """
 
 from __future__ import annotations

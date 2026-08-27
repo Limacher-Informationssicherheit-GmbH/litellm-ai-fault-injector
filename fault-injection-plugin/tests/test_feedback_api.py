@@ -46,3 +46,31 @@ def test_feedback_length_bounds_reject_oversized():
 
     with pytest.raises(ValidationError):
         feedback_api.Feedback(request_id="r", signal="noticed", note="x" * 3000)
+
+
+def test_rate_limiter_bounds_appends_per_client():
+    limiter = feedback_api._RateLimiter(per_minute=3)
+    assert [limiter.allow("1.2.3.4", 100.0) for _ in range(4)] == [True, True, True, False]
+    # a different client is unaffected
+    assert limiter.allow("5.6.7.8", 100.0) is True
+    # the window slides
+    assert limiter.allow("1.2.3.4", 161.0) is True
+
+
+def test_rate_limiter_disabled_when_zero():
+    limiter = feedback_api._RateLimiter(per_minute=0)
+    assert all(limiter.allow("1.2.3.4", 100.0) for _ in range(100))
+
+
+async def test_rate_limited_request_gets_429(monkeypatch):
+    class _Client:
+        host = "9.9.9.9"
+
+    class _Req:
+        client = _Client()
+
+    monkeypatch.setattr(feedback_api, "LIMITER", feedback_api._RateLimiter(1))
+    await feedback_api.enforce_rate_limit(_Req())
+    with pytest.raises(HTTPException) as ei:
+        await feedback_api.enforce_rate_limit(_Req())
+    assert ei.value.status_code == 429

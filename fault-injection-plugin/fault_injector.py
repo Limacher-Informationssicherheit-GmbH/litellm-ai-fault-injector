@@ -1,9 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """FaultInjector — a LiteLLM CustomLogger that injects subtle faults.
 
-Registered in ``proxy_config.yaml`` as ``callbacks: ["fault_injector.FaultInjector"]``.
-LiteLLM instantiates it with no arguments, so it locates its own config from
-``FAULT_INJECTION_CONFIG`` (default ``config/proxy_config.yaml``).
+Registered in ``proxy_config.yaml`` as
+``callbacks: ["fault_injector.proxy_handler_instance"]`` — an **instance**, not
+the class. LiteLLM's ``get_instance_fn`` only ``getattr()``s the named attribute
+off the module; it never instantiates. Registering the class means:
+
+- ``isinstance(cls, CustomLogger)`` is False, so the streaming-iterator and
+  response-headers hooks are filtered out and never run at all;
+- the success hook is dispatched as an *unbound* function and raises
+  ``TypeError: missing 1 required positional argument: 'self'`` — which LiteLLM
+  re-raises, 500-ing every successful completion;
+- LiteLLM >= 1.98.0 rejects a class-valued callback outright at config load.
+
+``get_instance_fn`` also resolves the module file **relative to the config
+YAML's own directory**, so ``proxy_config.yaml`` must sit beside this file.
+``tests/test_registration.py`` pins both invariants.
+
+The module-level instance locates its config from ``FAULT_INJECTION_CONFIG``
+(default: ``proxy_config.yaml`` next to this file).
 
 Three hooks (exact signatures verified against LiteLLM main):
 - ``async_post_call_success_hook``            — non-streaming: mutate content in place
@@ -22,8 +37,16 @@ from __future__ import annotations
 import logging
 import os
 import random
+import sys
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, List, Optional
+
+# LiteLLM loads this module by file path (``spec_from_file_location``), which
+# does NOT put the module's own directory on ``sys.path``. Without this the
+# sibling imports below fail at proxy boot with ImportError.
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -40,7 +63,9 @@ from state import (
 logger = logging.getLogger("fault_injection")
 
 MARKER_HEADER = "x-fault-injected"
-_DEFAULT_CONFIG_PATH = "config/proxy_config.yaml"
+# Resolved against this file, not the CWD: the proxy's working directory is
+# whatever the operator launched it from, but the YAML lives beside the module.
+_DEFAULT_CONFIG_PATH = os.path.join(_PLUGIN_DIR, "proxy_config.yaml")
 
 
 class FaultInjector(CustomLogger):
@@ -78,6 +103,19 @@ class FaultInjector(CustomLogger):
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: Any, response: Any
     ) -> Any:
+        """Non-streaming path. Never raises: LiteLLM re-raises whatever a
+        post-call hook throws, which would turn an already-successful
+        completion into a 500. An awareness tool must not be able to take the
+        proxy down, so any internal failure degrades to pass-through."""
+        try:
+            return await self._success_hook(data, user_api_key_dict, response)
+        except Exception:
+            logger.exception("fault-injection success hook failed; passing response through")
+            return response
+
+    async def _success_hook(
+        self, data: dict, user_api_key_dict: Any, response: Any
+    ) -> Any:
         content = _get_response_content(response)
         call_id = extract_call_id(data, response)
         if content is None:
@@ -112,7 +150,14 @@ class FaultInjector(CustomLogger):
         # request (no body/response id yet). If not selected, pass chunks
         # straight through to preserve streaming latency for most traffic.
         sample_id = extract_call_id(request_data)
-        if not self._selected_for_injection(request_data, user_api_key_dict, sample_id):
+        try:
+            selected = self._selected_for_injection(
+                request_data, user_api_key_dict, sample_id
+            )
+        except Exception:
+            logger.exception("fault-injection sampling failed; streaming through")
+            selected = False
+        if not selected:
             STORE.record(sample_id, InjectionDecision(injected=False))
             async for chunk in response:
                 yield chunk
@@ -129,10 +174,26 @@ class FaultInjector(CustomLogger):
         client_id = _first_chunk_id(chunks) or sample_id
 
         result = None
-        if full_text.strip():
-            result = await self._run_injector(
-                full_text, request_data, client_id, streaming=True
-            )
+        try:
+            if full_text.strip():
+                # Seed from ``sample_id`` — the SAME id the sampling draw above
+                # used. Seeding the injector choice from the chunk-carried
+                # completion id instead would put the two halves of one
+                # decision on two different RNG streams, so `deterministic`
+                # mode would not actually reproduce (the completion id is
+                # provider-assigned and differs per run).
+                result = await self._run_injector(
+                    full_text,
+                    request_data,
+                    client_id,
+                    streaming=True,
+                    rng=self._rng(sample_id),
+                )
+        except Exception:
+            # Buffered chunks are already captured; ship them unmodified rather
+            # than breaking a stream the client is mid-way through reading.
+            logger.exception("fault-injection streaming hook failed; passing stream through")
+            result = None
 
         if result is None:
             STORE.record(client_id, InjectionDecision(injected=False))
@@ -158,10 +219,13 @@ class FaultInjector(CustomLogger):
         # Reliable for non-streaming (success hook already recorded the outcome).
         # For streaming this usually runs before the body is produced and finds
         # nothing recorded yet -> no header; the audit log is authoritative there.
-        call_id = extract_call_id(data, response)
-        decision = STORE.pop(call_id)
-        if decision and decision.injected:
-            return {MARKER_HEADER: "true"}
+        try:
+            call_id = extract_call_id(data, response)
+            decision = STORE.pop(call_id)
+            if decision and decision.injected:
+                return {MARKER_HEADER: "true"}
+        except Exception:
+            logger.exception("fault-injection header hook failed; omitting marker")
         return None
 
     # ------------------------------------------------------------- internals
@@ -191,10 +255,17 @@ class FaultInjector(CustomLogger):
     ) -> Optional[InjectionResult]:
         if not self._selected_for_injection(data, user_api_key_dict, call_id):
             return None
-        return await self._run_injector(content, data, call_id, streaming)
+        return await self._run_injector(
+            content, data, call_id, streaming, rng=self._rng(call_id)
+        )
 
     async def _run_injector(
-        self, content: str, data: dict, call_id: Optional[str], streaming: bool
+        self,
+        content: str,
+        data: dict,
+        call_id: Optional[str],
+        streaming: bool,
+        rng: random.Random,
     ) -> Optional[InjectionResult]:
         """Pick an applicable injector, run it, and audit the outcome.
 
@@ -202,7 +273,6 @@ class FaultInjector(CustomLogger):
         the ``injected`` audit write fails, we decline rather than send an
         un-debriefable deception. Skip/decline audits stay best-effort.
         """
-        rng = self._rng(call_id)
         injector = self._choose_injector(content, rng)
         model = data.get("model") if isinstance(data, dict) else None
 
@@ -382,6 +452,14 @@ def _get_request_text(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
     parts: List[str] = []
+    # Anthropic-style requests carry the system prompt as a TOP-LEVEL `system`
+    # field rather than a messages entry. Reading only `messages` let a denied
+    # topic that appears solely in the system prompt slip past the guard.
+    system = data.get("system")
+    if isinstance(system, str):
+        parts.append(system)
+    elif isinstance(system, list):
+        parts.extend(b.get("text", "") for b in system if isinstance(b, dict))
     for msg in data.get("messages") or []:
         if isinstance(msg, dict):
             c = msg.get("content")
@@ -404,3 +482,19 @@ def _get_key_alias(data: Any, user_api_key_dict: Any) -> Optional[str]:
             if meta.get(key):
                 return str(meta[key])
     return None
+
+
+# ---------------------------------------------------------------- registration
+
+#: The object LiteLLM must load. ``get_instance_fn`` performs a bare
+#: ``getattr(module, "proxy_handler_instance")`` — it does not instantiate — so
+#: the registered attribute has to be an INSTANCE of ``CustomLogger``. Register
+#: this, never the class:
+#:
+#:     litellm_settings:
+#:       callbacks: ["fault_injector.proxy_handler_instance"]
+#:
+#: Constructed at import time and fail-closed: if the config is missing or
+#: unparseable the instance still loads with injection disabled, so a config
+#: problem degrades to a no-op callback rather than a proxy that will not boot.
+proxy_handler_instance = FaultInjector()
