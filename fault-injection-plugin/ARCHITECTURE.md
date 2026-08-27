@@ -75,6 +75,19 @@ layout of this plugin:
    `fault_injector.py` inserts its own directory there before importing its
    siblings.
 
+That second rule is also how the plugin finds its *own* settings. LiteLLM hands
+`get_instance_fn` the config path and hands the callback nothing, so the plugin
+has to locate the file itself — and it cannot do that by name: LiteLLM's own
+documented convention is `config.yaml`, and any operator using a name other than
+the one we guessed would get a fully registered, fully wired, permanently
+disabled injector whose only complaint is a warning on a logger nobody
+configured. `FaultInjectionConfig.discover()` therefore searches this directory
+for the YAML carrying a `fault_injection:` block — by **content, not filename**
+— and fails closed (with a warning naming the reason) when there is no
+candidate or more than one. Relative log paths are then anchored to that config
+file's directory, so the injector and the separate feedback process agree on
+where the JSONLs live regardless of their working directories.
+
 `tests/test_registration.py` re-implements that resolution against the shipped
 YAML, so both invariants fail in CI rather than at proxy boot. The hook-body
 tests construct a `FaultInjector` directly and structurally cannot catch either.
@@ -93,10 +106,15 @@ provider returns → async_post_call_success_hook  (mutate content, STAMP marker
 ```
 The marker is **not** dependent on hook order. `async_post_call_success_hook`
 stamps `x-fault-injected` onto `response._hidden_params["additional_headers"]`,
-which LiteLLM merges into the HTTP response at serialization — after every hook
-has run. The `async_post_call_response_headers_hook` (which reads the decision
-store) is only a **fallback**: it would miss the marker if it happened to run
-before the success hook, which is exactly why the stamp is the primary path.
+and LiteLLM **re-reads that dict after the success hook returns** and folds it
+into the outgoing headers. Be precise about the mechanism: it is one specific
+re-read on the non-streaming code path, *not* a serialization-time merge that
+applies everywhere. Two consequences follow. The
+`async_post_call_response_headers_hook` (which reads the decision store) is only
+a **fallback** — it would miss the marker if it ran before the success hook,
+which is why the stamp is the primary path. And on the streaming path the
+headers are already built and sent *before* the iterator hook runs, so no
+mechanism can carry the marker there (see below).
 
 **Streaming (`stream=true`):**
 ```

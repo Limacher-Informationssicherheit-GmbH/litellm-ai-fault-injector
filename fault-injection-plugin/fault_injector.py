@@ -14,11 +14,14 @@ off the module; it never instantiates. Registering the class means:
 - LiteLLM >= 1.98.0 rejects a class-valued callback outright at config load.
 
 ``get_instance_fn`` also resolves the module file **relative to the config
-YAML's own directory**, so ``proxy_config.yaml`` must sit beside this file.
+YAML's own directory**, so the proxy config must sit beside this file.
 ``tests/test_registration.py`` pins both invariants.
 
-The module-level instance locates its config from ``FAULT_INJECTION_CONFIG``
-(default: ``proxy_config.yaml`` next to this file).
+That same rule is how the plugin finds its own settings: LiteLLM never tells a
+callback which config loaded it, so the module-level instance scans its own
+directory for the YAML carrying a ``fault_injection:`` block (any filename —
+LiteLLM's own convention is ``config.yaml``). ``FAULT_INJECTION_CONFIG``
+overrides. Ambiguous or absent: fail closed, with a warning saying which.
 
 Three hooks (exact signatures verified against LiteLLM main):
 - ``async_post_call_success_hook``            — non-streaming: mutate content in place
@@ -39,7 +42,7 @@ import os
 import random
 import sys
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Callable, List, Optional
 
 # LiteLLM loads this module by file path (``spec_from_file_location``), which
 # does NOT put the module's own directory on ``sys.path``. Without this the
@@ -63,33 +66,27 @@ from state import (
 logger = logging.getLogger("fault_injection")
 
 MARKER_HEADER = "x-fault-injected"
-# Resolved against this file, not the CWD: the proxy's working directory is
-# whatever the operator launched it from, but the YAML lives beside the module.
-_DEFAULT_CONFIG_PATH = os.path.join(_PLUGIN_DIR, "proxy_config.yaml")
 
 
 class FaultInjector(CustomLogger):
     def __init__(self, config: Optional[FaultInjectionConfig] = None) -> None:
         super().__init__()
         if config is None:
-            path = os.getenv("FAULT_INJECTION_CONFIG", _DEFAULT_CONFIG_PATH)
-            try:
-                config = FaultInjectionConfig.from_yaml(path)
-            except FileNotFoundError:
-                logger.warning(
-                    "fault-injection config not found at %s; injection disabled", path
-                )
-                config = FaultInjectionConfig(enabled=False)
-            except Exception:
-                # Any parse/validation error must fail closed (injection off)
-                # rather than take down the proxy callback at load time.
-                logger.exception(
-                    "failed to load fault-injection config at %s; injection disabled",
-                    path,
-                )
-                config = FaultInjectionConfig(enabled=False)
+            # Discover by CONTENT in this module's directory rather than by a
+            # hardcoded filename: LiteLLM resolves the module against the config
+            # file's own directory but never tells the plugin which file that
+            # was, and its documented convention is `config.yaml`, not
+            # `proxy_config.yaml`. `discover` fails closed and logs why.
+            config = FaultInjectionConfig.discover(_PLUGIN_DIR)
         self.cfg = config
-        self.injectors = build_injectors(self.cfg)
+        try:
+            self.injectors = build_injectors(self.cfg)
+        except Exception:
+            # Constructing injectors must never abort module load: get_instance_fn
+            # re-raises, and the proxy then refuses to boot at all.
+            logger.exception("failed to build injectors; injection disabled")
+            self.cfg = FaultInjectionConfig(enabled=False)
+            self.injectors = {}
         logger.info(
             "FaultInjector loaded: enabled=%s rate=%s deterministic=%s types=%s",
             self.cfg.enabled,
@@ -125,15 +122,19 @@ class FaultInjector(CustomLogger):
             STORE.record(call_id, InjectionDecision(injected=False))
             return response
 
+        def apply(new_content: str) -> Callable[[], None]:
+            _set_response_content(response, new_content)
+            return lambda: _set_response_content(response, content)
+
         result = await self._decide_and_inject(
-            content, data, user_api_key_dict, call_id, streaming=False
+            content, data, user_api_key_dict, call_id, streaming=False, apply=apply
         )
         if result is not None:
-            _set_response_content(response, result.content)
-            # Stamp the marker onto the response itself so it survives regardless
-            # of whether the header hook runs before or after this hook (headers
-            # are assembled at serialization, after all hooks). The public header
-            # hook below is kept as a fallback.
+            # Content is already mutated by ``apply``; the audit succeeded, so
+            # this injection is committed. Stamp the marker onto the response
+            # itself: LiteLLM re-reads ``_hidden_params["additional_headers"]``
+            # after the success hook returns, which the header hook below cannot
+            # rely on being ordered against.
             _stamp_marker(response)
             STORE.record(
                 call_id,
@@ -173,21 +174,28 @@ class FaultInjector(CustomLogger):
         # request id only if the chunks carry none.
         client_id = _first_chunk_id(chunks) or sample_id
 
+        def apply(new_content: str) -> Callable[[], None]:
+            saved = _rewrite_stream_chunks(chunks, new_content)
+            def undo() -> None:
+                for delta, original in saved:
+                    delta.content = original
+            return undo
+
         result = None
         try:
             if full_text.strip():
-                # Seed from ``sample_id`` — the SAME id the sampling draw above
-                # used. Seeding the injector choice from the chunk-carried
-                # completion id instead would put the two halves of one
-                # decision on two different RNG streams, so `deterministic`
-                # mode would not actually reproduce (the completion id is
-                # provider-assigned and differs per run).
+                # Seed from ``sample_id`` — the id the sampling draw used — so
+                # `deterministic` mode reproduces. The chunk-carried completion
+                # id is provider-assigned and differs on every run; it is the
+                # right key for the AUDIT (the client echoes it to /feedback)
+                # and the wrong one for a seed.
                 result = await self._run_injector(
                     full_text,
                     request_data,
                     client_id,
                     streaming=True,
-                    rng=self._rng(sample_id),
+                    rng=self._rng(sample_id, "choose"),
+                    apply=apply,
                 )
         except Exception:
             # Buffered chunks are already captured; ship them unmodified rather
@@ -201,11 +209,12 @@ class FaultInjector(CustomLogger):
                 yield chunk
             return
 
+        # ``apply`` already rewrote the buffered chunks and the audit committed.
         STORE.record(
             client_id,
             InjectionDecision(injected=True, error_type=result.record.error_type),
         )
-        for chunk in _rewrite_stream_chunks(chunks, result.content):
+        for chunk in chunks:
             yield chunk
 
     async def async_post_call_response_headers_hook(
@@ -242,7 +251,7 @@ class FaultInjector(CustomLogger):
         request_text = _get_request_text(data)
         if not self.cfg.targets.is_targetable(key_alias, request_text):
             return False
-        rng = self._rng(call_id)
+        rng = self._rng(call_id, "sample")
         return rng.random() < self.cfg.inject_rate
 
     async def _decide_and_inject(
@@ -252,11 +261,14 @@ class FaultInjector(CustomLogger):
         user_api_key_dict: Any,
         call_id: Optional[str],
         streaming: bool,
+        apply: "Callable[[str], Callable[[], None]]",
     ) -> Optional[InjectionResult]:
         if not self._selected_for_injection(data, user_api_key_dict, call_id):
             return None
         return await self._run_injector(
-            content, data, call_id, streaming, rng=self._rng(call_id)
+            content, data, call_id, streaming,
+            rng=self._rng(call_id, "choose"),
+            apply=apply,
         )
 
     async def _run_injector(
@@ -266,12 +278,24 @@ class FaultInjector(CustomLogger):
         call_id: Optional[str],
         streaming: bool,
         rng: random.Random,
+        apply: "Callable[[str], Callable[[], None]]",
     ) -> Optional[InjectionResult]:
-        """Pick an applicable injector, run it, and audit the outcome.
+        """Pick an applicable injector, run it, apply it, and audit the outcome.
 
-        A durable audit record is a PRECONDITION for shipping an injection: if
-        the ``injected`` audit write fails, we decline rather than send an
-        un-debriefable deception. Skip/decline audits stay best-effort.
+        The invariant is two-way: an ``injected`` audit record exists **iff** the
+        client actually received the manipulation. So the manipulation is
+        applied FIRST (in memory, still reversible) and audited SECOND:
+
+        - apply fails  -> no audit line is written, original ships;
+        - audit fails  -> the apply is undone, original ships, no marker.
+
+        Auditing before applying would break the second half: any failure to
+        mutate the response (a frozen field, a response type LiteLLM changed)
+        leaves a durable "injected" record for a deception the user never saw,
+        and ``report.py`` scores it as an injection nobody noticed. Skip/decline
+        audits stay best-effort.
+
+        ``apply`` performs the mutation and returns a callable that reverts it.
         """
         injector = self._choose_injector(content, rng)
         model = data.get("model") if isinstance(data, dict) else None
@@ -292,15 +316,35 @@ class FaultInjector(CustomLogger):
             return None
 
         try:
+            undo = apply(result.content)
+        except Exception:
+            logger.exception(
+                "could not apply the manipulation to the response; shipping the "
+                "original un-audited (request_id=%s)", call_id,
+            )
+            self._audit_safe(
+                call_id, model, "skipped", injector.error_type,
+                "could not apply manipulation to response", content, None, streaming,
+            )
+            return None
+
+        try:
             self._audit_write(
                 call_id, model, "injected", result.record.error_type,
                 result.record.detail, content, result.content, streaming,
             )
         except Exception:
             logger.exception(
-                "audit write failed; declining injection to preserve the "
+                "audit write failed; reverting injection to preserve the "
                 "debrief guarantee (request_id=%s)", call_id,
             )
+            try:
+                undo()
+            except Exception:
+                logger.exception(
+                    "REVERT FAILED after a failed audit write — an unaudited "
+                    "manipulation may have shipped (request_id=%s)", call_id,
+                )
             return None
         return result
 
@@ -317,11 +361,21 @@ class FaultInjector(CustomLogger):
         chosen = rng.choices(names, weights=[weights[n] for n in names], k=1)[0]
         return dict(applicable)[chosen]
 
-    def _rng(self, call_id: Optional[str]) -> random.Random:
-        # Deterministic mode: seed per-call so runs are reproducible and
-        # order-independent under concurrency. Otherwise system entropy.
+    def _rng(self, call_id: Optional[str], purpose: str) -> random.Random:
+        """Per-call, per-purpose RNG.
+
+        ``purpose`` is what keeps the streams independent, and it is load-bearing.
+        Seeding sampling and injector-choice identically makes the *first*
+        variate of the choice draw the very same number the sampling draw
+        already accepted — and that number is by construction below
+        ``inject_rate``. ``random.choices`` scales it by the total weight, so it
+        lands in the first cumulative bucket essentially always: measured over
+        3000 calls with two equally weighted injectors, the second one never
+        fired once. The configured ``error_types`` distribution is silently
+        replaced by "whichever injector is listed first".
+        """
         if self.cfg.deterministic:
-            return random.Random(f"{self.cfg.seed}:{call_id}")
+            return random.Random(f"{self.cfg.seed}:{call_id}:{purpose}")
         return random.Random()
 
     def _audit_write(
@@ -365,10 +419,14 @@ class FaultInjector(CustomLogger):
 def _stamp_marker(response: Any) -> None:
     """Attach the marker header to the response's hidden params.
 
-    LiteLLM merges ``_hidden_params['additional_headers']`` into the outgoing
-    HTTP response at serialization time — after every hook has run — so this is
-    ordering-independent, unlike the header hook which may run before the
-    success hook. Best-effort: never break the response path.
+    On the non-streaming path LiteLLM re-reads
+    ``_hidden_params['additional_headers']`` *after* the success hook returns
+    and folds it into the outgoing HTTP headers, so this is independent of hook
+    ordering — unlike the header hook, which may run first. It is one specific
+    re-read on one code path, not a serialization-time merge: on the streaming
+    path headers are already built and sent before the iterator hook runs, so
+    the marker cannot appear there and the audit log is the debrief record.
+    Best-effort: never break the response path.
     """
     try:
         hidden = getattr(response, "_hidden_params", None)
@@ -422,14 +480,18 @@ def _assemble_stream_text(chunks: List[Any]) -> str:
 
 
 def _rewrite_stream_chunks(chunks: List[Any], new_content: str) -> List[Any]:
-    """Re-emit buffered chunks with the injected content.
+    """Rewrite buffered chunks in place to carry the injected content.
 
     The full new content is placed on the first chunk that carried delta text;
     every other content-bearing delta is blanked. Non-content chunks (role,
     finish_reason, usage) are preserved untouched so downstream clients still
     see a well-formed stream. Concatenating the deltas yields exactly
     ``new_content``.
+
+    Returns ``[(delta, original_content), ...]`` so the caller can undo the
+    rewrite if the audit write that must accompany it fails.
     """
+    saved: List[Any] = []
     placed = False
     for chunk in chunks:
         try:
@@ -440,12 +502,30 @@ def _rewrite_stream_chunks(chunks: List[Any], new_content: str) -> List[Any]:
             getattr(delta, "content", None), str
         ):
             continue
+        saved.append((delta, delta.content))
         if not placed:
             delta.content = new_content
             placed = True
         else:
             delta.content = ""
-    return chunks
+    return saved
+
+
+def _block_texts(blocks: Any) -> List[str]:
+    """Text of every content block, skipping anything that is not a string.
+
+    These blocks are caller-supplied. A block like ``{"text": 123}`` would make
+    the ``"\n".join`` below raise TypeError — which, now that the hooks contain
+    their own exceptions, means a client could silently disable the target-guard
+    for its own requests and flood the log with tracebacks.
+    """
+    out: List[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                out.append(text)
+    return out
 
 
 def _get_request_text(data: Any) -> str:
@@ -459,16 +539,14 @@ def _get_request_text(data: Any) -> str:
     if isinstance(system, str):
         parts.append(system)
     elif isinstance(system, list):
-        parts.extend(b.get("text", "") for b in system if isinstance(b, dict))
+        parts.extend(_block_texts(system))
     for msg in data.get("messages") or []:
         if isinstance(msg, dict):
             c = msg.get("content")
             if isinstance(c, str):
                 parts.append(c)
             elif isinstance(c, list):  # multimodal content blocks
-                parts.extend(
-                    b.get("text", "") for b in c if isinstance(b, dict)
-                )
+                parts.extend(_block_texts(c))
     return "\n".join(parts)
 
 

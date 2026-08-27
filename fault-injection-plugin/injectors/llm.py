@@ -77,12 +77,20 @@ class _LLMInjector:
 
         import litellm
 
+        # Built OUTSIDE the try: a KeyError here would be a coding bug in this
+        # module, and swallowing it as "declined" at INFO level would hide it
+        # forever. Computing the outer timeout up front also matters — as an
+        # argument it would be evaluated AFTER acompletion() built its
+        # coroutine, so a bad value abandoned that coroutine unawaited.
+        system_prompt = _PROMPTS[self.error_type]
+        outer_timeout = self._timeout_s + 5
+
         try:
             resp = await asyncio.wait_for(
                 litellm.acompletion(
                     model=self._model,
                     messages=[
-                        {"role": "system", "content": _PROMPTS[self.error_type]},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": content},
                     ],
                     temperature=0.7,
@@ -98,7 +106,7 @@ class _LLMInjector:
                 ),
                 # Hard wall-clock ceiling in case the provider timeout is
                 # ignored or the client hangs before it applies.
-                timeout=self._timeout_s + 5,
+                timeout=outer_timeout,
             )
         except Exception as exc:  # provider error, refusal-as-error, timeout
             return self._decline(f"llm call failed: {type(exc).__name__}")

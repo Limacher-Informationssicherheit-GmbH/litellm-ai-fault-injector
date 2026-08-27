@@ -22,6 +22,9 @@ import yaml
 
 logger = logging.getLogger("fault_injection.config")
 
+#: Env var pointing at the proxy config; overrides directory discovery.
+CONFIG_ENV_VAR = "FAULT_INJECTION_CONFIG"
+
 
 def _known_keys(raw: Optional[Dict[str, Any]], dc_cls: Any, name: str) -> Dict[str, Any]:
     """Keep only keys that are fields of ``dc_cls``; warn on unknown ones.
@@ -39,11 +42,32 @@ def _known_keys(raw: Optional[Dict[str, Any]], dc_cls: Any, name: str) -> Dict[s
 
 
 def _as_float(value: Any, default: float, what: str) -> float:
+    # `bool` is a subclass of `int`, so `float(True)` is 1.0. YAML resolves the
+    # bare words `yes`, `on` and `true` to True, and this config file is full of
+    # booleans (`enabled`, `deterministic`) — so `inject_rate: yes` is a very
+    # reachable typo that would otherwise mean "inject 100% of eligible
+    # traffic". A boolean is never a valid number here.
+    if isinstance(value, bool):
+        logger.warning("%s=%r is a boolean, not a number; using %s", what, value, default)
+        return default
     try:
         return float(value)
     except (TypeError, ValueError):
         logger.warning("%s=%r is not a number; using %s", what, value, default)
         return default
+
+
+def _as_bounded_float(
+    value: Any, default: float, lo: float, hi: float, what: str
+) -> float:
+    """``_as_float`` plus a range check; out-of-range falls back to ``default``."""
+    out = _as_float(value, default=default, what=what)
+    if not lo <= out <= hi:
+        logger.warning(
+            "%s=%r is outside [%s,%s]; using %s", what, value, lo, hi, default
+        )
+        return default
+    return out
 
 DEFAULT_ERROR_TYPES: Dict[str, float] = {
     "factual": 0.4,
@@ -70,6 +94,20 @@ class LLMInjectorConfig:
     model: str = "gpt-4o-mini"
     max_len_delta: float = 0.25  # discard rewrite if length changes by > this
     timeout_s: float = 20.0  # bound the inline rewrite call (see injectors/llm.py)
+
+    def __post_init__(self) -> None:
+        # Both are consumed inside the response path: an unvalidated value here
+        # does not fail loudly, it makes every LLM rewrite raise TypeError and
+        # decline at INFO level — i.e. the two highest-weighted injectors go
+        # silently dead while the report still shows their configured weights.
+        self.max_len_delta = _as_bounded_float(
+            self.max_len_delta, default=0.25, lo=0.0, hi=1.0,
+            what="llm_injector.max_len_delta",
+        )
+        self.timeout_s = _as_bounded_float(
+            self.timeout_s, default=20.0, lo=0.1, hi=300.0,
+            what="llm_injector.timeout_s",
+        )
 
 
 @dataclass
@@ -169,7 +207,104 @@ class FaultInjectionConfig:
     def from_yaml(cls, path: str) -> "FaultInjectionConfig":
         with open(path, "r", encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
-        return cls.from_dict(doc.get("fault_injection"))
+        cfg = cls.from_dict(doc.get("fault_injection"))
+        cfg._resolve_paths(os.path.dirname(os.path.abspath(path)))
+        return cfg
+
+    @staticmethod
+    def _configs_in(directory: str) -> List[str]:
+        """Every YAML in ``directory`` carrying a ``fault_injection:`` block."""
+        found: List[str] = []
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            return found
+        for name in names:
+            if not name.endswith((".yaml", ".yml")):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    doc = yaml.safe_load(fh)
+            except Exception:  # unreadable / not valid YAML -> not a candidate
+                continue
+            if isinstance(doc, dict) and isinstance(doc.get("fault_injection"), dict):
+                found.append(path)
+        return found
+
+    @classmethod
+    def discover(cls, search_dir: str) -> "FaultInjectionConfig":
+        """Locate the proxy config this plugin was loaded alongside.
+
+        LiteLLM hands ``get_instance_fn`` the config path but hands the plugin
+        nothing, so the plugin has to find its own settings. Hardcoding a
+        filename does not work: LiteLLM's own documented convention is
+        ``config.yaml``, and an operator using any name but the one we guessed
+        would get a fully registered, fully wired, permanently disabled
+        injector whose only complaint is a warning on an unconfigured logger.
+
+        What we *can* rely on is that ``get_instance_fn`` resolves the module
+        file against the config's own directory — so the config that loaded us
+        is in ``search_dir``. Find it by content (a ``fault_injection:`` block)
+        rather than by name.
+
+        Fails closed and says why: no candidate, several candidates, or an
+        unreadable file all yield a disabled config rather than a guess.
+        """
+        explicit = os.getenv(CONFIG_ENV_VAR)
+        if explicit:
+            try:
+                return cls.from_yaml(explicit)
+            except FileNotFoundError:
+                logger.warning(
+                    "%s=%s does not exist; injection disabled", CONFIG_ENV_VAR, explicit
+                )
+            except Exception:
+                logger.exception(
+                    "failed to load %s=%s; injection disabled", CONFIG_ENV_VAR, explicit
+                )
+            return cls(enabled=False)
+
+        matches = cls._configs_in(search_dir)
+        if len(matches) == 1:
+            try:
+                cfg = cls.from_yaml(matches[0])
+                logger.info("fault-injection config discovered at %s", matches[0])
+                return cfg
+            except Exception:
+                logger.exception(
+                    "failed to load discovered config %s; injection disabled", matches[0]
+                )
+                return cls(enabled=False)
+
+        if not matches:
+            logger.warning(
+                "no YAML in %s contains a `fault_injection:` block — injection "
+                "disabled. The proxy config must sit beside this module, or set "
+                "%s to point at it.",
+                search_dir, CONFIG_ENV_VAR,
+            )
+        else:
+            logger.warning(
+                "%d YAML files in %s contain a `fault_injection:` block (%s); "
+                "refusing to guess which one is live — set %s. Injection disabled.",
+                len(matches), search_dir, ", ".join(matches), CONFIG_ENV_VAR,
+            )
+        return cls(enabled=False)
+
+    def _resolve_paths(self, base_dir: str) -> None:
+        """Anchor relative log paths to the CONFIG's directory, not the CWD.
+
+        The proxy's working directory is whatever the operator launched it
+        from, and the feedback service is a separate process that may well have
+        a different one. Leaving `./audit/...` CWD-relative means the two halves
+        of the tool can write to two different trees and `report.py` joins
+        nothing, with no error anywhere.
+        """
+        for attr in ("audit_log_path", "feedback_log_path"):
+            value = getattr(self, attr)
+            if value and not os.path.isabs(value):
+                setattr(self, attr, os.path.normpath(os.path.join(base_dir, value)))
 
     def _apply_env_overrides(self) -> None:
         # One-directional kill-switch: the env var can only force injection OFF,

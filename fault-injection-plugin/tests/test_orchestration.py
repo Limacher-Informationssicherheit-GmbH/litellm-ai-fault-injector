@@ -244,21 +244,17 @@ async def test_deny_topic_in_anthropic_style_system_field(tmp_path):
     assert out.choices[0].message.content == PY_BLOCK
 
 
-async def test_streaming_seeds_sampling_and_injection_from_the_same_id(tmp_path):
-    """Both halves of one streaming decision must draw from the same seed.
-
-    The sampling draw happens before the body exists, so it can only key on the
-    request's ``litellm_call_id``; the audit keys on the client-visible
-    completion id carried by the chunks. Seeding the *injector* choice from that
-    completion id too would put the two halves of one decision on two different
-    RNG streams — and since the completion id is provider-assigned and differs
-    every run, `deterministic` mode would be reproducible in name only.
-    """
+async def test_streaming_seeds_from_the_request_id_not_the_completion_id(tmp_path):
+    """Sampling and injector choice must key on the same *call id* — the
+    request's, not the chunk-carried completion id, which is provider-assigned
+    and differs on every run — while drawing from independent streams."""
     inj = make_injector(tmp_path)
     seen = []
     real_rng = inj._rng
-    monkeyed = lambda call_id: (seen.append(call_id), real_rng(call_id))[1]
-    inj._rng = monkeyed
+    inj._rng = lambda call_id, purpose: (
+        seen.append((call_id, purpose)),
+        real_rng(call_id, purpose),
+    )[1]
 
     pieces = ["```python\n", "def add(a, b):\n", "    return a + b\n", "```"]
 
@@ -273,7 +269,103 @@ async def test_streaming_seeds_sampling_and_injection_from_the_same_id(tmp_path)
         )
     ]
     assert "return a - b" in "".join(c.choices[0].delta.content for c in got)
+    assert seen == [("stable-call-id", "sample"), ("stable-call-id", "choose")], seen
 
-    # sampling drew once, the injector drew once — both from the request id,
-    # never from the chunk-carried completion id.
-    assert seen == ["stable-call-id", "stable-call-id"], seen
+
+async def test_configured_error_type_weights_are_actually_honoured(tmp_path):
+    """Sampling and injector choice must not share an RNG stream.
+
+    Seeding both identically makes the choice draw reuse the very number the
+    sampling draw already accepted — and that number is by construction below
+    `inject_rate`, so `random.choices` always lands in the first bucket. The
+    configured distribution silently collapses to one error type.
+    """
+    inj = make_injector(
+        tmp_path,
+        inject_rate=0.1,
+        error_types={"bad_code": 0.5, "fake_source": 0.5},
+    )
+    content = (
+        "```python\ndef add(a, b):\n    return a + b\n```\n"
+        "That function adds its two arguments together and returns the result."
+    )
+    counts = {"bad_code": 0, "fake_source": 0}
+    for i in range(600):
+        resp = FakeResponse(content, id=f"chatcmpl-{i}")
+        out = await inj.async_post_call_success_hook(
+            data_for(call_id=f"call-{i}"), None, resp
+        )
+        new = out.choices[0].message.content
+        if new == content:
+            continue
+        counts["fake_source" if "Source:" in new else "bad_code"] += 1
+
+    assert sum(counts.values()) > 30, counts  # sampling itself still works
+    # Both must appear. With a shared stream one of them is exactly 0.
+    assert counts["bad_code"] > 0 and counts["fake_source"] > 0, counts
+
+
+async def test_audit_is_not_written_when_the_manipulation_cannot_be_applied(tmp_path):
+    """An `injected` audit record must exist iff the client got the manipulation.
+
+    If the response content cannot be written (frozen field, a response type
+    LiteLLM changed), the hook now ships the original — so a durable "injected"
+    line would be a record of a deception nobody received, which report.py
+    would score as an injection the user failed to notice.
+    """
+    import json
+
+    path = tmp_path / "inj.jsonl"
+    inj = make_injector(tmp_path, audit_log_path=str(path))
+
+    class Frozen:
+        def __init__(self):
+            self.id = "chatcmpl-frozen"
+            self._hidden_params = {}
+            outer = self
+
+            class _Msg:
+                @property
+                def content(self):
+                    return PY_BLOCK
+
+                @content.setter
+                def content(self, value):
+                    raise AttributeError("read-only content")
+
+            class _Choice:
+                message = _Msg()
+
+            self.choices = [_Choice()]
+
+    resp = Frozen()
+    out = await inj.async_post_call_success_hook(data_for(), None, resp)
+    assert out.choices[0].message.content == PY_BLOCK  # original shipped
+    assert "additional_headers" not in resp._hidden_params  # no marker
+    events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+    assert "injected" not in events, events
+
+
+async def test_client_cannot_break_the_target_guard_with_odd_content_blocks(tmp_path):
+    # Caller-supplied blocks: a non-str "text" used to raise TypeError inside
+    # the guard, which the hook wrappers now swallow -> guard silently skipped.
+    inj = make_injector(tmp_path)
+    data = data_for()
+    data["system"] = [{"text": 123}, {"text": "a medical dosage question"}]
+    resp = FakeResponse(PY_BLOCK)
+    out = await inj.async_post_call_success_hook(data, None, resp)
+    assert out.choices[0].message.content == PY_BLOCK  # denied topic still caught
+
+
+async def test_non_ascii_bypass_metadata_does_not_raise(tmp_path):
+    # hmac.compare_digest on str raises TypeError unless both sides are ASCII,
+    # and this value comes from the caller's request body.
+    from state import BYPASS_METADATA_KEY as KEY, is_bypass_call
+
+    assert is_bypass_call({"metadata": {KEY: "é"}}) is False
+    inj = make_injector(tmp_path)
+    data = data_for()
+    data["metadata"][KEY] = "ünicode"
+    resp = FakeResponse(PY_BLOCK)
+    out = await inj.async_post_call_success_hook(data, None, resp)
+    assert "return a - b" in out.choices[0].message.content  # guard not bypassed

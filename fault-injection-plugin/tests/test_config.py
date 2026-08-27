@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import os
+
+import yaml
+
 from config import FaultInjectionConfig, LLM_ERROR_TYPES
 
 
@@ -101,3 +105,77 @@ def test_unknown_nested_key_does_not_crash():
 
 def test_non_numeric_rate_fails_closed():
     assert FaultInjectionConfig.from_dict({"inject_rate": "ten"}).inject_rate == 0.0
+
+
+def test_boolean_inject_rate_fails_closed():
+    # YAML resolves the bare words `yes`, `on` and `true` to True, and float(True)
+    # is 1.0 — which is inside [0,1], so a range check alone lets it through as
+    # 100% injection. In a config file full of booleans this is a live typo.
+    assert yaml.safe_load("inject_rate: yes") == {"inject_rate": True}
+    for raw in (True, False):
+        assert FaultInjectionConfig.from_dict({"inject_rate": raw}).inject_rate == 0.0
+
+
+def test_boolean_weights_fail_closed():
+    cfg = FaultInjectionConfig.from_dict({"error_types": {"bad_code": True}})
+    assert cfg.error_types["bad_code"] == 0.0
+
+
+def test_llm_injector_numbers_are_validated():
+    # unvalidated values do not fail loudly: they make every rewrite raise
+    # TypeError and decline at INFO level, so the two highest-weighted
+    # injectors go silently dead.
+    llm = FaultInjectionConfig.from_dict(
+        {"llm_injector": {"timeout_s": "20s", "max_len_delta": "wide"}}
+    ).llm_injector
+    assert llm.timeout_s == 20.0
+    assert llm.max_len_delta == 0.25
+    assert FaultInjectionConfig.from_dict(
+        {"llm_injector": {"timeout_s": -5}}
+    ).llm_injector.timeout_s == 20.0
+    assert FaultInjectionConfig.from_dict(
+        {"llm_injector": {"timeout_s": 3}}
+    ).llm_injector.timeout_s == 3.0
+
+
+def _write_cfg(path, **fault_injection):
+    path.write_text(yaml.safe_dump({"fault_injection": fault_injection}))
+
+
+def test_discover_finds_the_config_by_content_not_by_filename(tmp_path, monkeypatch):
+    # LiteLLM's own documented convention is `config.yaml`. Hardcoding
+    # `proxy_config.yaml` gave a fully registered, permanently disabled plugin.
+    monkeypatch.delenv("FAULT_INJECTION_CONFIG", raising=False)
+    (tmp_path / "unrelated.yaml").write_text(yaml.safe_dump({"model_list": []}))
+    _write_cfg(tmp_path / "config.yaml", enabled=True, inject_rate=0.5)
+
+    cfg = FaultInjectionConfig.discover(str(tmp_path))
+    assert cfg.enabled is True and cfg.inject_rate == 0.5
+
+
+def test_discover_fails_closed_on_no_or_ambiguous_candidates(tmp_path, monkeypatch):
+    monkeypatch.delenv("FAULT_INJECTION_CONFIG", raising=False)
+    assert FaultInjectionConfig.discover(str(tmp_path)).enabled is False
+
+    _write_cfg(tmp_path / "a.yaml", enabled=True)
+    _write_cfg(tmp_path / "b.yaml", enabled=True)
+    # two live candidates: refuse to guess rather than arm the wrong one
+    assert FaultInjectionConfig.discover(str(tmp_path)).enabled is False
+
+
+def test_discover_honours_the_env_override(tmp_path, monkeypatch):
+    _write_cfg(tmp_path / "elsewhere.yaml", enabled=True, inject_rate=0.3)
+    monkeypatch.setenv("FAULT_INJECTION_CONFIG", str(tmp_path / "elsewhere.yaml"))
+    assert FaultInjectionConfig.discover("/nonexistent").inject_rate == 0.3
+
+    monkeypatch.setenv("FAULT_INJECTION_CONFIG", str(tmp_path / "missing.yaml"))
+    assert FaultInjectionConfig.discover(str(tmp_path)).enabled is False
+
+
+def test_relative_log_paths_resolve_against_the_config_not_the_cwd(tmp_path):
+    # The proxy and the feedback service are separate processes with possibly
+    # different working directories; CWD-relative paths let them write to two
+    # different trees, and report.py then joins nothing with no error.
+    _write_cfg(tmp_path / "config.yaml", audit_log_path="./audit/inj.jsonl")
+    cfg = FaultInjectionConfig.from_yaml(str(tmp_path / "config.yaml"))
+    assert cfg.audit_log_path == os.path.join(str(tmp_path), "audit", "inj.jsonl")

@@ -74,3 +74,30 @@ async def test_rate_limited_request_gets_429(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         await feedback_api.enforce_rate_limit(_Req())
     assert ei.value.status_code == 429
+
+
+def test_rate_limiter_client_map_is_bounded():
+    # The previous reclaim branch scanned for empty windows, but every path
+    # that drains a window appends in the same call — so it never freed
+    # anything and the map grew one entry per source IP forever, on an
+    # endpoint that is unauthenticated by default.
+    limiter = feedback_api._RateLimiter(per_minute=5, max_clients=100)
+    for i in range(5_000):
+        limiter.allow(f"10.0.{i // 256}.{i % 256}", 100.0)
+    assert len(limiter._hits) <= 100
+
+
+def test_rate_limiter_still_limits_a_persistent_client_under_churn():
+    limiter = feedback_api._RateLimiter(per_minute=2, max_clients=100)
+    assert limiter.allow("1.1.1.1", 100.0) is True
+    assert limiter.allow("1.1.1.1", 100.0) is True
+    assert limiter.allow("1.1.1.1", 100.0) is False
+
+
+async def test_auth_rejects_non_ascii_header_without_raising(monkeypatch):
+    # Starlette decodes headers as latin-1; compare_digest on str raises
+    # TypeError unless both sides are ASCII, which would 500 instead of 401.
+    monkeypatch.setattr(feedback_api, "FEEDBACK_TOKEN", "s3cret")
+    with pytest.raises(HTTPException) as ei:
+        await feedback_api.require_auth("Bearer ünicode")
+    assert ei.value.status_code == 401

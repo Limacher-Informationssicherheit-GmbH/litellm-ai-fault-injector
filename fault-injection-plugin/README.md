@@ -93,10 +93,18 @@ that looks correct and never runs:
   positional argument: 'self'` — a 500 on every completion. LiteLLM ≥ 1.98.0
   rejects a class-valued callback at config load instead.
 - **The module path resolves relative to the YAML**, as
-  `dirname(config) + "/fault_injector.py"` — not via `sys.path`. So
-  `proxy_config.yaml` must live in the same directory as `fault_injector.py`.
-  (The module puts its own directory on `sys.path` at import so its sibling
-  imports work under LiteLLM's by-file-path loading.)
+  `dirname(config) + "/fault_injector.py"` — not via `sys.path`. So the proxy
+  config must live in the same directory as `fault_injector.py`. (The module
+  puts its own directory on `sys.path` at import so its sibling imports work
+  under LiteLLM's by-file-path loading.)
+
+The filename does not matter. LiteLLM never tells a callback which config
+loaded it, so the plugin searches its own directory for the YAML carrying a
+`fault_injection:` block — by content, not by name — and fails closed with a
+warning if there is no candidate or more than one. Set `FAULT_INJECTION_CONFIG`
+to override. Relative `audit_log_path` / `feedback_log_path` are anchored to
+that config's directory, not to the working directory, so the proxy and the
+feedback service cannot drift apart.
 
 `tests/test_registration.py` pins both against the real shipped YAML.
 
@@ -104,7 +112,7 @@ that looks correct and never runs:
 
 | var | effect |
 |-----|--------|
-| `FAULT_INJECTION_CONFIG` | path to the proxy config (default: `proxy_config.yaml` beside the module); read by both the plugin and the feedback service |
+| `FAULT_INJECTION_CONFIG` | explicit path to the proxy config; overrides the content-based discovery described above. Read by both the plugin and the feedback service |
 | `FAULT_INJECTION_ENABLED` | one-directional kill-switch: a falsy value forces injection **off**; a truthy value cannot enable a disabled config |
 | `FAULT_FEEDBACK_TOKEN` | bearer token required by `POST /feedback` (unset = open, and logged as a warning — bind to localhost then) |
 | `FAULT_FEEDBACK_LOG` | overrides the `feedback_log_path` from the config |
@@ -145,9 +153,11 @@ private network. The feedback path follows `feedback_log_path` from the config
   shape-guard detects this and **no-ops** rather than corrupting the response.
 - **Audit/feedback logs are sensitive at rest** — they hold verbatim model
   output (original *and* manipulated), though not request prompts. Files and
-  directories are created `0600`/`0700` and all `*.jsonl` are gitignored
-  regardless of the configured path; still apply a retention policy, and tighten
-  any pre-existing `audit/` (creation modes do not touch existing files).
+  directories are created `0600`/`0700` and `audit/` is untracked so it is
+  created rather than arriving at the umask's mode; all `*.jsonl` are gitignored
+  regardless of the configured path. A pre-existing directory keeps its own mode
+  — the plugin logs a warning naming it rather than silently chmod'ing a path it
+  did not create. Apply a retention policy.
 - **`deny_topics` is best-effort, not a safety boundary.** It substring-scans the
   *request* only (messages plus an Anthropic-style top-level `system`), so it
   misses high-stakes *answers* whose prompts contain no keyword, and it is

@@ -2,8 +2,11 @@
 # ignore every .jsonl (incl. rotations) regardless of the configured path.
 *.jsonl
 *.jsonl.*
-audit/*
-!audit/.gitkeep
+# The audit directory is deliberately NOT tracked: a checked-in directory
+# arrives at the umask's mode (typically 0755) and already exists, so
+# audit_log's owner-only creation mode would never apply to it. Letting the
+# plugin create it on first write gets 0700.
+audit/
 
 __pycache__/
 *.py[cod]

@@ -17,10 +17,14 @@ stays import-time pure and testable.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import stat
 import threading
 from dataclasses import asdict, dataclass
 from typing import Optional
+
+logger = logging.getLogger("fault_injection.audit")
 
 _lock = threading.Lock()
 
@@ -47,6 +51,32 @@ class AuditEntry:
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 
+_warned_dirs = set()
+
+
+def _ensure_dir(directory: str) -> None:
+    """Create ``directory`` owner-only, or warn once if it already exists open.
+
+    ``os.makedirs(mode=...)`` only applies to directories it actually creates,
+    so a pre-existing world-readable ``audit/`` silently stays that way. Rather
+    than chmod'ing a directory we did not create (it may be a deliberate mount
+    or shared volume), say so once — loudly enough that it is actionable.
+    """
+    os.makedirs(directory, mode=_DIR_MODE, exist_ok=True)
+    if directory in _warned_dirs:
+        return
+    _warned_dirs.add(directory)
+    try:
+        mode = stat.S_IMODE(os.stat(directory).st_mode)
+    except OSError:
+        return
+    if mode & 0o077:
+        logger.warning(
+            "audit directory %s is mode %s — it holds verbatim model output "
+            "readable by other local accounts. Run: chmod 0700 %s",
+            directory, oct(mode), directory,
+        )
+
 
 def append_json(path: str, obj: dict) -> None:
     """Append one JSON object as a line to ``path`` (creating dirs as needed).
@@ -57,12 +87,17 @@ def append_json(path: str, obj: dict) -> None:
     line = json.dumps(obj, ensure_ascii=False)
     directory = os.path.dirname(path)
     if directory:
-        os.makedirs(directory, mode=_DIR_MODE, exist_ok=True)
+        _ensure_dir(directory)
     with _lock:
         # os.open (not open()) so the create mode is set atomically at creation
         # rather than after a brief world-readable window.
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, _FILE_MODE)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        try:
+            fh = os.fdopen(fd, "a", encoding="utf-8")
+        except Exception:
+            os.close(fd)  # fdopen did not take ownership; don't leak the fd
+            raise
+        with fh:
             fh.write(line + "\n")
 
 

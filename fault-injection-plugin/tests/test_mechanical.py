@@ -102,12 +102,19 @@ async def test_fake_source_declines_on_tiny_input():
 
 
 def test_audit_files_are_owner_only(tmp_path):
+    import os
     import stat
 
     import audit_log
 
-    path = tmp_path / "nested" / "inj.jsonl"
-    audit_log.append_json(str(path), {"a": 1})
+    # Force a permissive umask for the duration: asserting the resulting mode
+    # under a restrictive ambient umask passes even with the hardening removed.
+    old_umask = os.umask(0o022)
+    try:
+        path = tmp_path / "nested" / "inj.jsonl"
+        audit_log.append_json(str(path), {"a": 1})
+    finally:
+        os.umask(old_umask)
     # these lines hold verbatim model output; the process umask would otherwise
     # typically leave them world-readable on a shared host
     assert stat.S_IMODE(path.stat().st_mode) == 0o600

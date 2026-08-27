@@ -3,6 +3,8 @@
 # This file MUST live in the same directory as fault_injector.py: LiteLLM's
 # get_instance_fn resolves a dotted callback path against *this file's*
 # directory (dirname(config) + "/fault_injector.py"), not against sys.path.
+# The filename itself is free — the plugin locates its settings by looking for
+# the `fault_injection:` block below, not by name.
 #
 # Start the proxy from the plugin root:  litellm --config proxy_config.yaml
 #

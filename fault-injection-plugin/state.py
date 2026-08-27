@@ -101,9 +101,21 @@ def extract_call_id(data: Optional[dict], response: object = None) -> Optional[s
     return None
 
 
+_BYPASS_TOKEN_BYTES = BYPASS_TOKEN.encode("utf-8")
+
+
 def _is_our_token(value: object) -> bool:
-    """Constant-time check that ``value`` is this process's bypass token."""
-    return isinstance(value, str) and hmac.compare_digest(value, BYPASS_TOKEN)
+    """Constant-time check that ``value`` is this process's bypass token.
+
+    Compares as BYTES. ``hmac.compare_digest`` on ``str`` requires both operands
+    to be ASCII and raises TypeError otherwise — and this value comes straight
+    from the caller's request body, so ``{"metadata": {...: "é"}}`` would raise
+    inside the sampler on every such request: injection silently skipped for
+    that caller, plus a full traceback in the log on demand.
+    """
+    if not isinstance(value, str):
+        return False
+    return hmac.compare_digest(value.encode("utf-8"), _BYPASS_TOKEN_BYTES)
 
 
 def is_bypass_call(data: Optional[dict]) -> bool:
