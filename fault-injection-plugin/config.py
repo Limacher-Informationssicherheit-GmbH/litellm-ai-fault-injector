@@ -58,8 +58,18 @@ LLM_ERROR_TYPES = frozenset({"factual", "logic_break"})
 
 @dataclass
 class LLMInjectorConfig:
+    """Settings for the LLM-in-the-loop injectors (``factual``, ``logic_break``).
+
+    PRIVACY: these injectors send the **full original answer** to ``model`` via
+    a direct SDK call, so that text leaves by whatever path ``model`` resolves
+    to — bypassing any DLP/redaction the proxy itself applies. Point ``model``
+    at a deployment cleared for the data in scope, or use ``deterministic: true``
+    (mechanical injectors only) if answers must not leave the proxy at all.
+    """
+
     model: str = "gpt-4o-mini"
     max_len_delta: float = 0.25  # discard rewrite if length changes by > this
+    timeout_s: float = 20.0  # bound the inline rewrite call (see injectors/llm.py)
 
 
 @dataclass
@@ -83,9 +93,13 @@ class TargetConfig:
     deny_topics: List[str] = field(default_factory=list)
 
     def is_targetable(self, key_alias: Optional[str], request_text: str) -> bool:
-        if not any(
-            fnmatch.fnmatch(key_alias or "", pat) for pat in self.allow_key_aliases
-        ):
+        # An absent/empty alias is never targetable. Without this, the catch-all
+        # pattern ``"*"`` matches the empty string, so every request that
+        # carries no key alias at all (unkeyed callers, internal traffic) would
+        # be eligible — the opposite of a blast-radius control.
+        if not key_alias:
+            return False
+        if not any(fnmatch.fnmatch(key_alias, pat) for pat in self.allow_key_aliases):
             return False
         lowered = request_text.lower()
         return not any(topic.lower() in lowered for topic in self.deny_topics)
@@ -106,15 +120,23 @@ class FaultInjectionConfig:
     feedback_log_path: str = "./audit/feedback.jsonl"
 
     def __post_init__(self) -> None:
-        # Clamp the sampling rate so a config typo (e.g. reading "10%" as `10`)
-        # can never silently become 100% injection of a deception tool. A
-        # non-numeric typo (e.g. "ten") fails closed to 0.0 rather than crashing.
+        # An out-of-range sampling rate FAILS CLOSED to 0.0 — it is never
+        # clamped up. Clamping `inject_rate: 10` (a "10%"-read-as-10 typo) to
+        # 1.0 would turn the typo into 100% injection of a deception tool: the
+        # single worst outcome, produced by the guard meant to prevent it. A
+        # value outside [0,1] is not a rate, so it means "operator intent is
+        # unknown" — and the safe reading of unknown intent is "inject nothing".
+        # A non-numeric typo (e.g. "ten") fails closed the same way.
         raw_rate = self.inject_rate
-        self.inject_rate = min(1.0, max(0.0, _as_float(raw_rate, default=0.0, what="inject_rate")))
-        if self.inject_rate != raw_rate:
+        rate = _as_float(raw_rate, default=-1.0, what="inject_rate")
+        if not 0.0 <= rate <= 1.0:
             logger.warning(
-                "inject_rate %r out of [0,1]; clamped to %s", raw_rate, self.inject_rate
+                "inject_rate %r is outside [0,1]; failing closed to 0.0 "
+                "(injection disabled) — set a fraction, e.g. 0.1 for 10%%",
+                raw_rate,
             )
+            rate = 0.0
+        self.inject_rate = rate
         # Negative / non-numeric weights are floored to 0 (never crash boot).
         self.error_types = {
             k: max(0.0, _as_float(v, default=0.0, what=f"weight[{k}]"))
@@ -126,7 +148,7 @@ class FaultInjectionConfig:
             if not str(path).endswith(".jsonl"):
                 logger.warning(
                     "log path %r does not end in .jsonl — ensure it is gitignored "
-                    "and access-controlled (it holds full prompts/responses)",
+                    "and access-controlled (it holds verbatim model output)",
                     path,
                 )
 

@@ -56,11 +56,28 @@ def test_empty_allowlist_fails_closed():
     assert t.is_targetable("redteam-eu", "anything") is False
 
 
-def test_inject_rate_clamped():
-    # a "10%"-read-as-10 typo must not become 1000% injection
-    assert FaultInjectionConfig.from_dict({"inject_rate": 10}).inject_rate == 1.0
+def test_wildcard_allowlist_still_excludes_unkeyed_requests():
+    # fnmatch("", "*") is True, so a naive check would make every request that
+    # carries no key alias eligible under ["*"] — the opposite of a guard.
+    t = FaultInjectionConfig.from_dict(
+        {"targets": {"allow_key_aliases": ["*"]}}
+    ).targets
+    assert t.is_targetable("redteam-eu", "anything") is True
+    assert t.is_targetable(None, "anything") is False
+    assert t.is_targetable("", "anything") is False
+
+
+def test_inject_rate_out_of_range_fails_closed():
+    # A "10%"-read-as-10 typo must fail CLOSED (0.0), not clamp UP to 1.0 —
+    # clamping up turns the typo into 100% injection, the worst possible
+    # outcome from the guard meant to prevent it.
+    assert FaultInjectionConfig.from_dict({"inject_rate": 10}).inject_rate == 0.0
+    assert FaultInjectionConfig.from_dict({"inject_rate": 100}).inject_rate == 0.0
     assert FaultInjectionConfig.from_dict({"inject_rate": -1}).inject_rate == 0.0
+    # in-range values pass through untouched, boundaries included
     assert FaultInjectionConfig.from_dict({"inject_rate": 0.25}).inject_rate == 0.25
+    assert FaultInjectionConfig.from_dict({"inject_rate": 1}).inject_rate == 1.0
+    assert FaultInjectionConfig.from_dict({"inject_rate": 0}).inject_rate == 0.0
 
 
 def test_negative_weights_floored():

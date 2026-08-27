@@ -4,7 +4,7 @@ import pytest
 from conftest import FakeResponse, fake_stream, FakeChunk
 from config import FaultInjectionConfig
 from fault_injector import FaultInjector, MARKER_HEADER
-from state import BYPASS_METADATA_KEY
+from state import BYPASS_METADATA_KEY, BYPASS_TOKEN
 
 PY_BLOCK = "```python\ndef add(a, b):\n    return a + b\n```"
 PROSE = "The capital of France is Paris and the Eiffel Tower opened in 1889."
@@ -125,9 +125,23 @@ async def test_bypass_call_skipped(tmp_path):
     inj = make_injector(tmp_path)
     resp = FakeResponse(PY_BLOCK)
     data = data_for()
-    data[BYPASS_METADATA_KEY] = True
+    data[BYPASS_METADATA_KEY] = BYPASS_TOKEN
     out = await inj.async_post_call_success_hook(data, None, resp)
     assert out.choices[0].message.content == PY_BLOCK
+
+
+async def test_client_cannot_forge_the_bypass_tag(tmp_path):
+    # `data["metadata"]` is the caller's request body: a truthy-value check
+    # would let any client opt out of the awareness test (and skew the
+    # noticed-rate) by sending {"metadata": {"_fault_injection_bypass": true}}.
+    # Only this process's secret token counts.
+    for forged in (True, 1, "true", "yes", BYPASS_TOKEN[:-1] + "x"):
+        inj = make_injector(tmp_path)
+        resp = FakeResponse(PY_BLOCK)
+        data = data_for()
+        data["metadata"][BYPASS_METADATA_KEY] = forged
+        out = await inj.async_post_call_success_hook(data, None, resp)
+        assert "return a - b" in out.choices[0].message.content, forged
 
 
 async def test_streaming_passthrough_when_not_selected(tmp_path):
@@ -161,7 +175,8 @@ async def test_llm_injector_via_stub(tmp_path, monkeypatch):
 
     async def fake_acompletion(*args, **kwargs):
         # ensure the nested call is tagged to bypass injection
-        assert kwargs.get("metadata", {}).get(BYPASS_METADATA_KEY) is True
+        assert kwargs.get("metadata", {}).get(BYPASS_METADATA_KEY) == BYPASS_TOKEN
+        assert kwargs.get("timeout")  # inline call must be bounded
         return FakeResponse(
             "The capital of France is Paris and the Eiffel Tower opened in 1901."
         )
@@ -188,3 +203,77 @@ async def test_llm_injector_declines_on_unchanged(tmp_path, monkeypatch):
     resp = FakeResponse(PROSE)
     out = await inj.async_post_call_success_hook(data_for(), None, resp)
     assert out.choices[0].message.content == PROSE  # passed through
+
+
+async def test_hook_exception_never_500s_a_successful_completion(tmp_path, monkeypatch):
+    # LiteLLM re-raises whatever a post-call hook throws, turning an already
+    # successful completion into a 500. An awareness tool must degrade to
+    # pass-through, never take the proxy down.
+    inj = make_injector(tmp_path)
+    monkeypatch.setattr(
+        inj, "_selected_for_injection", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    resp = FakeResponse(PY_BLOCK)
+    out = await inj.async_post_call_success_hook(data_for(), None, resp)
+    assert out.choices[0].message.content == PY_BLOCK
+
+    # ...and the streaming path still delivers every buffered chunk
+    pieces = ["Paris ", "is nice."]
+    got = [
+        c
+        async for c in inj.async_post_call_streaming_iterator_hook(
+            None, fake_stream(pieces), data_for()
+        )
+    ]
+    assert [c.choices[0].delta.content for c in got] == pieces
+
+
+async def test_deny_topic_in_anthropic_style_system_field(tmp_path):
+    # Anthropic-style requests carry the system prompt top-level, not in
+    # `messages`; a denied topic there must still block injection.
+    inj = make_injector(tmp_path)
+    data = data_for(text="summarise this")
+    data["system"] = "You are a medical triage assistant."
+    resp = FakeResponse(PY_BLOCK)
+    out = await inj.async_post_call_success_hook(data, None, resp)
+    assert out.choices[0].message.content == PY_BLOCK
+
+    data["system"] = [{"type": "text", "text": "You advise on medical dosage."}]
+    resp = FakeResponse(PY_BLOCK)
+    out = await inj.async_post_call_success_hook(data, None, resp)
+    assert out.choices[0].message.content == PY_BLOCK
+
+
+async def test_streaming_seeds_sampling_and_injection_from_the_same_id(tmp_path):
+    """Both halves of one streaming decision must draw from the same seed.
+
+    The sampling draw happens before the body exists, so it can only key on the
+    request's ``litellm_call_id``; the audit keys on the client-visible
+    completion id carried by the chunks. Seeding the *injector* choice from that
+    completion id too would put the two halves of one decision on two different
+    RNG streams — and since the completion id is provider-assigned and differs
+    every run, `deterministic` mode would be reproducible in name only.
+    """
+    inj = make_injector(tmp_path)
+    seen = []
+    real_rng = inj._rng
+    monkeyed = lambda call_id: (seen.append(call_id), real_rng(call_id))[1]
+    inj._rng = monkeyed
+
+    pieces = ["```python\n", "def add(a, b):\n", "    return a + b\n", "```"]
+
+    async def stream():
+        for piece in pieces:
+            yield FakeChunk(piece, id="chatcmpl-provider-assigned")
+
+    got = [
+        c
+        async for c in inj.async_post_call_streaming_iterator_hook(
+            None, stream(), data_for(call_id="stable-call-id")
+        )
+    ]
+    assert "return a - b" in "".join(c.choices[0].delta.content for c in got)
+
+    # sampling drew once, the injector drew once — both from the request id,
+    # never from the chunk-carried completion id.
+    assert seen == ["stable-call-id", "stable-call-id"], seen

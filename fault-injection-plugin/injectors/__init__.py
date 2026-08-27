@@ -34,12 +34,13 @@ def build_injectors(cfg: FaultInjectionConfig) -> Dict[str, Injector]:
         "fake_source": FakeSourceInjector(),
     }
     if not cfg.deterministic:
-        injectors["factual"] = FactualInjector(
-            cfg.llm_injector.model, cfg.llm_injector.max_len_delta
+        llm_args = (
+            cfg.llm_injector.model,
+            cfg.llm_injector.max_len_delta,
+            cfg.llm_injector.timeout_s,
         )
-        injectors["logic_break"] = LogicBreakInjector(
-            cfg.llm_injector.model, cfg.llm_injector.max_len_delta
-        )
+        injectors["factual"] = FactualInjector(*llm_args)
+        injectors["logic_break"] = LogicBreakInjector(*llm_args)
     # keep only types that also carry a positive weight in the active set
     active = cfg.active_error_types()
     return {k: v for k, v in injectors.items() if active.get(k, 0) > 0}

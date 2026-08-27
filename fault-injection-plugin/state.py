@@ -20,6 +20,8 @@ oldest-first so a crash between the two hooks cannot leak memory unbounded.
 
 from __future__ import annotations
 
+import hmac
+import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -27,6 +29,17 @@ from typing import Optional
 
 # metadata key used to mark the injector's own LLM calls so they bypass sampling
 BYPASS_METADATA_KEY = "_fault_injection_bypass"
+
+#: Per-process secret proving a bypass tag came from *us*.
+#:
+#: ``data["metadata"]`` on a proxy request is caller-controlled: LiteLLM passes
+#: the request body's metadata straight through to the hooks. A truthy-value
+#: check therefore let any client opt itself out of the awareness test just by
+#: sending ``{"metadata": {"_fault_injection_bypass": true}}`` — silently
+#: skewing the noticed-rate the tool exists to measure. The tag must instead
+#: carry a value only this process knows; it is regenerated every boot and
+#: never leaves memory.
+BYPASS_TOKEN = secrets.token_urlsafe(32)
 
 _MAX_ENTRIES = 10_000
 
@@ -88,11 +101,21 @@ def extract_call_id(data: Optional[dict], response: object = None) -> Optional[s
     return None
 
 
+def _is_our_token(value: object) -> bool:
+    """Constant-time check that ``value`` is this process's bypass token."""
+    return isinstance(value, str) and hmac.compare_digest(value, BYPASS_TOKEN)
+
+
 def is_bypass_call(data: Optional[dict]) -> bool:
-    """True if this request is the injector's own LLM call and must be skipped."""
+    """True if this request is the injector's own LLM call and must be skipped.
+
+    Only a tag carrying ``BYPASS_TOKEN`` counts. A client-supplied tag with any
+    other value (``true``, ``1``, a guessed string) is ignored, so callers
+    cannot exempt themselves from sampling.
+    """
     if not isinstance(data, dict):
         return False
-    if data.get(BYPASS_METADATA_KEY):
+    if _is_our_token(data.get(BYPASS_METADATA_KEY)):
         return True
     meta = data.get("metadata") or {}
-    return bool(meta.get(BYPASS_METADATA_KEY))
+    return isinstance(meta, dict) and _is_our_token(meta.get(BYPASS_METADATA_KEY))

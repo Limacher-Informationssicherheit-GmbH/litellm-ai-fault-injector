@@ -99,3 +99,16 @@ async def test_fake_source_appends_citation():
 async def test_fake_source_declines_on_tiny_input():
     inj = FakeSourceInjector()
     assert inj.applies("hi") is False
+
+
+def test_audit_files_are_owner_only(tmp_path):
+    import stat
+
+    import audit_log
+
+    path = tmp_path / "nested" / "inj.jsonl"
+    audit_log.append_json(str(path), {"a": 1})
+    # these lines hold verbatim model output; the process umask would otherwise
+    # typically leave them world-readable on a shared host
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700

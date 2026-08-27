@@ -65,23 +65,50 @@ seed — fully reproducible, and the mode used by the test suite.
 
 ```bash
 pip install -r requirements.txt        # pins litellm[proxy]==1.93.0 (hook surface moves weekly)
-# ensure the plugin dir is importable, then start the proxy (from the plugin root):
-litellm --config config/proxy_config.yaml
+# start the proxy FROM THE PLUGIN ROOT (the YAML must sit beside fault_injector.py):
+litellm --config proxy_config.yaml
 # in a SEPARATE terminal, the reaction-capture service (also from the plugin root):
-uvicorn feedback_api:app --port 8181
+uvicorn feedback_api:app --host 127.0.0.1 --port 8181
 ```
 
-Configuration lives under the `fault_injection:` key of `config/proxy_config.yaml`
-(see that file for every option). The kill-switch is `enabled`.
+Configuration lives under the `fault_injection:` key of `proxy_config.yaml`
+(see that file for every option). The kill-switch is `enabled`, and the shipped
+example is **off** — arm it deliberately, per deployment.
+
+### Registration (the part that is easy to get wrong)
+
+```yaml
+litellm_settings:
+  callbacks: ["fault_injector.proxy_handler_instance"]   # an INSTANCE, not the class
+```
+
+Two LiteLLM behaviours constrain this, and getting either wrong yields a plugin
+that looks correct and never runs:
+
+- **`get_instance_fn` does not instantiate.** It performs a bare
+  `getattr(module, attr)`. Registering `fault_injector.FaultInjector` leaves
+  LiteLLM holding a *class*: `isinstance(cb, CustomLogger)` is False, so the
+  streaming-iterator and response-headers hooks are silently dropped, while the
+  success hook is dispatched unbound and raises `TypeError: missing 1 required
+  positional argument: 'self'` — a 500 on every completion. LiteLLM ≥ 1.98.0
+  rejects a class-valued callback at config load instead.
+- **The module path resolves relative to the YAML**, as
+  `dirname(config) + "/fault_injector.py"` — not via `sys.path`. So
+  `proxy_config.yaml` must live in the same directory as `fault_injector.py`.
+  (The module puts its own directory on `sys.path` at import so its sibling
+  imports work under LiteLLM's by-file-path loading.)
+
+`tests/test_registration.py` pins both against the real shipped YAML.
 
 **Environment variables:**
 
 | var | effect |
 |-----|--------|
-| `FAULT_INJECTION_CONFIG` | path to the proxy config (default `config/proxy_config.yaml`); read by both the plugin and the feedback service |
+| `FAULT_INJECTION_CONFIG` | path to the proxy config (default: `proxy_config.yaml` beside the module); read by both the plugin and the feedback service |
 | `FAULT_INJECTION_ENABLED` | one-directional kill-switch: a falsy value forces injection **off**; a truthy value cannot enable a disabled config |
-| `FAULT_FEEDBACK_TOKEN` | bearer token required by `POST /feedback` (unset = open — bind to localhost then) |
+| `FAULT_FEEDBACK_TOKEN` | bearer token required by `POST /feedback` (unset = open, and logged as a warning — bind to localhost then) |
 | `FAULT_FEEDBACK_LOG` | overrides the `feedback_log_path` from the config |
+| `FAULT_FEEDBACK_RATE_LIMIT` | `POST /feedback` requests per minute per client IP (default `60`; `0` disables) |
 
 ## Debrief / reporting
 
@@ -116,13 +143,30 @@ private network. The feedback path follows `feedback_log_path` from the config
 - **Unified endpoint only.** The content hook acts on `choices[0].message.content`.
   Pass-through endpoints (e.g. `/v1/messages`) hand the hook a raw dict; a
   shape-guard detects this and **no-ops** rather than corrupting the response.
-- **Audit/feedback logs are sensitive at rest** (full prompts/responses). All
-  `*.jsonl` are gitignored regardless of the configured path; apply filesystem
-  permissions and a retention policy.
+- **Audit/feedback logs are sensitive at rest** — they hold verbatim model
+  output (original *and* manipulated), though not request prompts. Files and
+  directories are created `0600`/`0700` and all `*.jsonl` are gitignored
+  regardless of the configured path; still apply a retention policy, and tighten
+  any pre-existing `audit/` (creation modes do not touch existing files).
 - **`deny_topics` is best-effort, not a safety boundary.** It substring-scans the
-  *prompt* only, so it misses high-stakes *answers* whose prompts contain no
-  keyword. The real blast-radius control is the **key-alias allowlist** — point
-  red-team keys only at low-stakes corpora.
+  *request* only (messages plus an Anthropic-style top-level `system`), so it
+  misses high-stakes *answers* whose prompts contain no keyword, and it is
+  brittle to synonyms and other languages. The real blast-radius control is the
+  **key-alias allowlist** — point red-team keys only at low-stakes corpora.
+  A request carrying no key alias is never targetable, so even `["*"]` excludes
+  unkeyed traffic; that is not a reason to ship `["*"]`.
+- **The LLM injectors are an egress path.** `factual` and `logic_break` send the
+  **full original answer** to `llm_injector.model` over a direct SDK call, which
+  skips whatever DLP or redaction the proxy applies to normal traffic. Point that
+  model at a cleared deployment, or set `deterministic: true` to drop the LLM
+  family entirely and keep every answer inside the proxy. The call is bounded by
+  `llm_injector.timeout_s`.
+- **`inject_rate` fails closed.** A value outside `[0,1]` (e.g. `10` from reading
+  "10%") is **not** clamped up to `1.0` — it resolves to `0.0` and logs a
+  warning. Clamping up would turn a typo into 100% injection.
+- **A hook failure never breaks a response.** All three hooks contain their own
+  exceptions and degrade to pass-through; LiteLLM re-raises what a post-call hook
+  throws, so an uncontained error would 500 an already-successful completion.
 
 ## Testing
 
@@ -133,6 +177,13 @@ python -m pytest        # hermetic: stubs litellm, no network, no proxy needed
 Unit tests cover each injector (seeded/deterministic), sampling, target-guard,
 kill-switch, shape-guard, streaming buffer-and-inject, the no-recursion bypass,
 the feedback API, and the report join.
+
+`tests/test_registration.py` covers the other half: whether LiteLLM will ever
+*call* the hooks. It re-implements `get_instance_fn`'s resolution against the
+real shipped `proxy_config.yaml` and asserts the callback resolves to an
+instance, the YAML sits beside the module, every hook is on the leaf class, and
+each hook accepts LiteLLM's keyword call site. Hook-body tests construct a
+`FaultInjector` by hand and so cannot catch any of that.
 
 The **integration smoke test** (`tests/test_integration_smoke.py`) builds a real
 `ModelResponse` with the installed LiteLLM and drives the hooks against it —
@@ -145,6 +196,24 @@ RUN_INTEGRATION=1 python -m pytest tests/test_integration_smoke.py
 
 A full end-to-end against a booted proxy is documented as a manual step in that
 test's docstring.
+
+## Operating guidance
+
+If you run this:
+
+- **Dedicated `redteam-*` key aliases only.** Never `allow_key_aliases: ["*"]`.
+- **Set `FAULT_FEEDBACK_TOKEN`** and bind the feedback service to `127.0.0.1`.
+  Without a token anyone reachable can forge reaction signals and skew the
+  noticed-rate the tool exists to measure.
+- **Treat `audit/*.jsonl` as sensitive at rest.** New files/dirs are created
+  `0600`/`0700`, but tighten any that predate this (`chmod -R go-rwx audit/`)
+  and set a retention policy. The lines hold verbatim model output; the injector
+  does not log request prompts.
+- **Prefer `deterministic: true`** if answers must not leave the proxy.
+- **Keep `inject_rate` in `[0,1]`** — anything else silently disables injection.
+- **Hash-pin `litellm[proxy]==1.93.0` yourself** (`pip-compile --generate-hashes`)
+  and re-run the suite, `tests/test_registration.py` included, on any bump: the
+  hook surface and the callback-loading rules both move between releases.
 
 ## License
 
